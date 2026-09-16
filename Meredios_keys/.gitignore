@@ -1,8 +1,0 @@
-__pycache__/
-*.pyc
-.env
-keys.db
-*.db-journal
-.venv/
-venv/
-data/
