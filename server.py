@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 # MEREDIOS key system v2 — Telegram inline-menu bot + FastAPI + SQLite
+# NOTE: keys stored in mixed case (e.g. "MerediosHUB-XXXX"); all lookups
+# use WHERE UPPER(key)=? with .upper() input to stay case-insensitive.
 import os, sqlite3, secrets, time, asyncio, logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Header
@@ -71,9 +73,7 @@ def create_key_for_user(user_id, days=30):
     now = int(time.time())
     exp = now + days * 86400
     con = db()
-    # revoke any existing non-revoked key from this user
     con.execute("UPDATE keys SET revoked=1 WHERE bound_tg=? AND revoked=0", (user_id,))
-    # generate fresh unique key
     for _ in range(20):
         k = gen_key()
         try:
@@ -142,7 +142,6 @@ async def is_subscribed(user_id):
     if not r.get("ok"):
         desc = (r.get("description") or "").lower()
         log.warning("getChatMember failed: %s", desc)
-        # bot not admin in channel / channel not found → don't lock user out
         return True
     status = (r.get("result") or {}).get("status", "")
     return status in ("creator", "administrator", "member", "restricted")
@@ -218,7 +217,6 @@ async def handle_callback(cb):
     message_id = cb["message"]["message_id"]
     data = cb.get("data", "")
 
-    # каждый callback = recheck subscription (кроме уже прошедших)
     if data == "check_sub":
         if await is_subscribed(user_id):
             await tg_answer_cb(cb_id, "✅ Подписка подтверждена")
@@ -227,7 +225,6 @@ async def handle_callback(cb):
             await tg_answer_cb(cb_id, "❌ Ты ещё не подписался", show_alert=True)
         return
 
-    # все остальные действия требуют подписки
     if not await is_subscribed(user_id):
         await tg_answer_cb(cb_id, "❌ Сначала подпишись", show_alert=True)
         await tg_edit(chat_id, message_id, TEXT_SUBSCRIBE, kb_subscribe())
@@ -268,7 +265,7 @@ async def handle_callback(cb):
             await tg_answer_cb(cb_id, "❌ Ключ не найден", show_alert=True)
             return
         con = db()
-        con.execute("UPDATE keys SET hwid=NULL WHERE key=?", (row["key"],))
+        con.execute("UPDATE keys SET hwid=NULL WHERE UPPER(key)=?", (row["key"].upper(),))
         con.commit()
         con.close()
         row = get_user_key(user_id)
@@ -293,7 +290,6 @@ async def handle_message(msg):
     cmd = parts[0].split("@")[0].lower()
     args = parts[1:]
 
-    # ---------- /start ----------
     if cmd == "/start":
         if not await is_subscribed(user_id):
             await tg_send(chat_id, TEXT_SUBSCRIBE, kb_subscribe())
@@ -301,12 +297,10 @@ async def handle_message(msg):
         await tg_send(chat_id, TEXT_MENU, kb_main())
         return
 
-    # ---------- /whoami ----------
     if cmd == "/whoami":
         await tg_send(chat_id, f"TG id: <code>{user_id}</code>\nUsername: @{username}")
         return
 
-    # ---------- /mykey (алиас на кнопку) ----------
     if cmd == "/mykey":
         row = get_user_key(user_id)
         if not row:
@@ -315,14 +309,13 @@ async def handle_message(msg):
         await tg_send(chat_id, fmt_key(row), kb_mykey(True))
         return
 
-    # ---------- /key XXX ----------
     if cmd == "/key":
         if not args:
             await tg_send(chat_id, "Формат: <code>/key ТВОЙ-КЛЮЧ</code>")
             return
-        key = args[0].strip().upper()
+        key_upper = args[0].strip().upper()
         con = db()
-        row = con.execute("SELECT * FROM keys WHERE key=?", (key,)).fetchone()
+        row = con.execute("SELECT * FROM keys WHERE UPPER(key)=?", (key_upper,)).fetchone()
         if not row:
             con.close(); await tg_send(chat_id, "❌ Ключ не найден."); return
         if row["revoked"]:
@@ -331,15 +324,14 @@ async def handle_message(msg):
             con.close(); await tg_send(chat_id, "❌ Ключ истёк."); return
         if row["bound_tg"] and row["bound_tg"] != user_id:
             con.close(); await tg_send(chat_id, "❌ Уже привязан к другому аккаунту."); return
-        con.execute("UPDATE keys SET bound_tg=?, bound_at=? WHERE key=?",
-                    (user_id, int(time.time()), key))
+        con.execute("UPDATE keys SET bound_tg=?, bound_at=? WHERE UPPER(key)=?",
+                    (user_id, int(time.time()), key_upper))
         con.commit()
-        row = con.execute("SELECT * FROM keys WHERE key=?", (key,)).fetchone()
+        row = con.execute("SELECT * FROM keys WHERE UPPER(key)=?", (key_upper,)).fetchone()
         con.close()
         await tg_send(chat_id, "✅ Привязан.\n\n" + fmt_key(row), kb_mykey(True))
         return
 
-    # ---------- admin ----------
     if not is_admin(user_id):
         await tg_send(chat_id, "⛔ Нет доступа.")
         return
@@ -387,7 +379,7 @@ async def handle_message(msg):
         if not args:
             await tg_send(chat_id, "Формат: <code>/revoke КЛЮЧ</code>"); return
         con = db()
-        cur = con.execute("UPDATE keys SET revoked=1 WHERE key=?", (args[0].upper(),))
+        cur = con.execute("UPDATE keys SET revoked=1 WHERE UPPER(key)=?", (args[0].strip().upper(),))
         con.commit(); con.close()
         await tg_send(chat_id, "✅ Отозван." if cur.rowcount else "❌ Не найден.")
         return
@@ -396,7 +388,7 @@ async def handle_message(msg):
         if not args:
             await tg_send(chat_id, "Формат: <code>/rebind КЛЮЧ</code>"); return
         con = db()
-        cur = con.execute("UPDATE keys SET hwid=NULL WHERE key=?", (args[0].upper(),))
+        cur = con.execute("UPDATE keys SET hwid=NULL WHERE UPPER(key)=?", (args[0].strip().upper(),))
         con.commit(); con.close()
         await tg_send(chat_id, "✅ HWID сброшен." if cur.rowcount else "❌ Не найден.")
         return
@@ -404,14 +396,14 @@ async def handle_message(msg):
     if cmd == "/extend":
         if len(args) < 2 or not args[1].isdigit():
             await tg_send(chat_id, "Формат: <code>/extend КЛЮЧ ДНИ</code>"); return
-        key, days = args[0].upper(), int(args[1])
+        key_upper, days = args[0].strip().upper(), int(args[1])
         con = db()
-        row = con.execute("SELECT * FROM keys WHERE key=?", (key,)).fetchone()
+        row = con.execute("SELECT * FROM keys WHERE UPPER(key)=?", (key_upper,)).fetchone()
         if not row:
             con.close(); await tg_send(chat_id, "❌ Не найден."); return
         base = max(int(time.time()), row["expires_at"])
         new_exp = base + days * 86400
-        con.execute("UPDATE keys SET expires_at=? WHERE key=?", (new_exp, key))
+        con.execute("UPDATE keys SET expires_at=? WHERE UPPER(key)=?", (new_exp, key_upper))
         con.commit(); con.close()
         await tg_send(chat_id, f"✅ До {time.strftime('%Y-%m-%d', time.localtime(new_exp))}")
         return
@@ -499,7 +491,6 @@ async def validate(req: Request, x_api_secret: str = Header(default="")):
     if not key or not hwid:
         return {"ok": False, "status": "missing_fields"}
 
-    # ---------- admin test key ----------
     if key.lower() == ADMIN_TEST_KEY:
         return {
             "ok": True,
@@ -511,7 +502,7 @@ async def validate(req: Request, x_api_secret: str = Header(default="")):
     key_upper = key.upper()
     now = int(time.time())
     con = db()
-    row = con.execute("SELECT * FROM keys WHERE key=?", (key_upper,)).fetchone()
+    row = con.execute("SELECT * FROM keys WHERE UPPER(key)=?", (key_upper,)).fetchone()
 
     if not row:
         con.close()
@@ -528,7 +519,7 @@ async def validate(req: Request, x_api_secret: str = Header(default="")):
     stored_hwid = row["hwid"]
 
     if stored_hwid is None:
-        con.execute("UPDATE keys SET hwid=?, used_count=used_count+1 WHERE key=?", (hwid, key_upper))
+        con.execute("UPDATE keys SET hwid=?, used_count=used_count+1 WHERE UPPER(key)=?", (hwid, key_upper))
         con.commit()
         con.close()
         return {
@@ -542,7 +533,7 @@ async def validate(req: Request, x_api_secret: str = Header(default="")):
         con.close()
         return {"ok": False, "status": "hwid_mismatch"}
 
-    con.execute("UPDATE keys SET used_count=used_count+1 WHERE key=?", (key_upper,))
+    con.execute("UPDATE keys SET used_count=used_count+1 WHERE UPPER(key)=?", (key_upper,))
     con.commit()
     con.close()
     return {
